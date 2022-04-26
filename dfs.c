@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <sys/poll.h>
 #include <poll.h>
+#include <dirent.h>
 
 #define MAXBUF   1024  /* max I/O buffer size */
 #define MAXLINE  256  /* max text line length */
@@ -62,10 +63,6 @@ int send_to_socket(int connfd, char *buf, size_t len, FILE *log){
 
 // }
 
-void store_piece(){
-
-}
-
 void put(int connfd, char *filename, FILE *log){
     fprintf(log, "put %s\n", filename);
     int n_read;
@@ -92,27 +89,54 @@ void get(){
 
 }
 
-void ls(){
+void list(int connfd, char *username, FILE *log){
+    char sendbuf[MAXBUF];
+    struct dirent *dir;
+    DIR *d;
+    int n_sent;
+    int n_written;
 
+    fprintf(log, "Sending file list for %s\n", username);
+    
+    d = opendir(username);
+    if (d){
+        errno = 0;
+        while((dir = readdir(d)) != NULL){
+            if (errno)
+                perror("Error reading dir");
+            fprintf(log, "Found file: %s\n", dir->d_name);
+            if ((dir->d_name[1] != '.') && (dir->d_name[1] != 0)){
+                strlcat(sendbuf, dir->d_name, MAXBUF);
+                n_written = strlcat(sendbuf, " ", MAXBUF);
+            }
+        }
+        closedir(d);
+    } else {
+        fprintf(log, "Failed to open dir: %s\n", strerror(errno));
+    }
+    n_sent = send_to_socket(connfd, &sendbuf[0], n_written, log);
+    if(n_sent != n_written)
+        fprintf(log, "List failed to send all bytes\n");
+    return;
 }
 
 
 bool authenticate(int connfd, char *username, char *password, FILE *log){
     fprintf(log, "Authenticating %s:%s\n", username, password);
-    char ok[3] = "ok";
-    char no[3] = "no";
+    char ok[4] = "ok ";
+    char no[4] = "no ";
 
     for(int i=0; i<g_numusers; i++){
         if (strcmp(username, g_users[i]) == 0){
             if (strcmp(password, g_passwords[i]) == 0){
                 fprintf(log, "authenticated\n");
                 mkdir(username, 0777);
-                send_to_socket(connfd, &ok[0], 2, log);
+                send_to_socket(connfd, &ok[0], 3, log);
                 return true;
             }
         }
     }
-    send_to_socket(connfd, &no[0], 2, log);
+    send_to_socket(connfd, &no[0], 3, log);
     return false;
 }
 
@@ -150,10 +174,12 @@ void parse_request(int connfd, FILE *log){
     }
     if (!authenticate(connfd, &username[0], &password[0], log))
         return;
-    printf("Authenticated!\n");
+    //printf("Authenticated!\n");
 
     if(strncmp(splitptr, "put", 3) == 0)
         put(connfd, &filename[0], log);
+    else if (strncmp(splitptr, "list", 4) == 0)
+        list(connfd, &username[0], log);
 }
 
 FILE *create_logfile(connfd){
@@ -230,8 +256,7 @@ void read_conf(){
         useridx++;
         line = fgets(&linebuf[0], MAXLINE, fp);
     }
-
-    // everything is deallocated when process exits
+    fclose(fp);
 }
 
 /* 
@@ -248,8 +273,8 @@ int open_listenfd(int port)
         return -1;
 
     /* Eliminates "Address already in use" error from bind. */
-    // if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, (const void *)&optval , sizeof(int)) < 0)
-    //     return -1;
+    if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, (const void *)&optval , sizeof(int)) < 0)
+        return -1;
 
     bzero((char *) &serveraddr, sizeof(serveraddr));
     serveraddr.sin_family = AF_INET; 
