@@ -21,6 +21,7 @@
 #define MAXBUF   1024  /* max I/O buffer size */
 #define MAXLINE  256  /* max text line length */
 #define LISTENQ  1024  /* second argument to listen() */
+#define N_SERVERS 4
 
 char **g_users;
 char **g_passwords;
@@ -59,19 +60,32 @@ int send_to_socket(int connfd, char *buf, size_t len, FILE *log){
     return -1;
 }
 
-// void mkdir(){
+void send_from_file_to_socket(FILE *fp, int connfd, FILE *log){
+    char buf[MAXBUF];
+    int n_read;
+    int n_sent;
 
-// }
+    bzero(buf, MAXBUF);
+    n_read = fread(buf, 1, MAXBUF, fp);
+    while(n_read > 0){
+        n_sent = send_to_socket(connfd, &buf[0], n_read, log);
+        n_read = fread(buf, 1, MAXBUF, fp);
+    }
+}
 
-void put(int connfd, char *filename, FILE *log){
-    fprintf(log, "put %s\n", filename);
+void put(int connfd, char *username, char *filename, FILE *log){
+    fprintf(log, "put %s/%s\n", username, filename);
     int n_read;
     int n_written;
     char recvbuf[MAXBUF];
     FILE *fp;
     bzero(recvbuf, MAXBUF);
+    char path[MAXLINE];
 
-    if((fp = fopen(filename, "w")) == NULL){
+    bzero(path, MAXLINE);
+    sprintf(path, "%s/%s", username, filename);
+
+    if((fp = fopen(path, "w")) == NULL){
         fprintf(log, "Error creating file %s\n", filename);
         return;
     }
@@ -85,8 +99,86 @@ void put(int connfd, char *filename, FILE *log){
     fclose(fp);
 }
 
-void get(){
+void get(int connfd, char *username, char *filename, FILE *log){
+    FILE *fp;
+    char path[MAXLINE];
 
+    sprintf(path, "%s/%s", username, filename);
+
+    if ((fp = fopen(path, "r")) == 0){
+        fprintf(log, "Did not find file %s\n", path);
+        return;
+    }
+    fprintf(log, "Found file %s\n", path);
+    send_from_file_to_socket(fp, connfd, log);
+    fclose(fp);
+}
+
+uint32_t get_file_len(char *username, char *filename, FILE *log){
+    FILE *fp;
+    uint32_t len;
+    char path[MAXLINE];
+
+    sprintf(path, "%s/%s", username, filename);
+
+    fp = fopen(path, "r");
+    if (!fp){
+        fprintf(log, "Failed to open %s for length calculation\n", path);
+        return 0;
+    }
+    fseek(fp, 0, SEEK_END);
+    len = (uint32_t)ftell(fp);
+    fclose(fp);
+    fprintf(log, "Found length %u for file %s\n", len, path);
+    return len;
+}
+
+// Semi redundant with list, but I don't want to use RegEx matching for the names
+void query(int connfd, char *username, char *filename, FILE *log){
+    char sendbuf[16]; // room for four uint32_t numbers
+    uint32_t *bufptr;
+    struct dirent *dir;
+    DIR *d;
+    int n_sent;
+    int n_written;
+    int piece_id;
+    uint32_t piece_len;
+    char *piece_ptr;
+    char local_filename[MAXLINE];
+
+    fprintf(log, "Sending pieces list for %s, %s\n", username, filename);
+    bzero(sendbuf, 16);
+    bufptr = (uint32_t *)sendbuf;
+    d = opendir(username);
+    if (d){
+        errno = 0;
+        while((dir = readdir(d)) != NULL){
+            if (errno)
+                perror("Error reading dir");
+            fprintf(log, "Found file: %s\n", dir->d_name);
+            if(!dir->d_name[1])
+                continue; 
+            strcpy(local_filename, &dir->d_name[1]);
+            *strrchr(local_filename, '.') = 0; // cut off at last dot
+            if (strcmp(local_filename, filename) == 0){ // both length and content must match
+                piece_ptr = strrchr(dir->d_name, '.');
+                if (!piece_ptr){
+                    fprintf(log, "Error reading filename\n");
+                    continue;
+                }
+                piece_ptr++; // skip the dot
+                piece_id = atoi(piece_ptr) - 1; // Switch to zero indexing
+                piece_len = get_file_len(username, dir->d_name, log);
+                fprintf(log, "Sending length %u for file %s piece %i\n", piece_len, dir->d_name, piece_id);
+                bufptr[piece_id] = piece_len;
+            }
+        }
+        closedir(d);
+    } else
+        fprintf(log, "Failed to open dir: %s\n", strerror(errno));
+    fprintf(log, "Query response: %u, %u, %u, %u\n", bufptr[0], bufptr[1], bufptr[2], bufptr[3]);
+    n_sent = send_to_socket(connfd, &sendbuf[0], 16, log);
+    return;
 }
 
 void list(int connfd, char *username, FILE *log){
@@ -120,7 +212,6 @@ void list(int connfd, char *username, FILE *log){
     return;
 }
 
-
 bool authenticate(int connfd, char *username, char *password, FILE *log){
     fprintf(log, "Authenticating %s:%s\n", username, password);
     char ok[4] = "ok ";
@@ -140,13 +231,13 @@ bool authenticate(int connfd, char *username, char *password, FILE *log){
     return false;
 }
 
-
 void parse_request(int connfd, FILE *log){
     int n_read;
     char recvbuf[MAXBUF];
     char username[MAXLINE];
     char password[MAXLINE];
     char filename[MAXLINE];
+    // char hints[MAXLINE];
     char *bufptr;
     char *splitptr;
     char *filenameptr;
@@ -155,6 +246,7 @@ void parse_request(int connfd, FILE *log){
     bzero(username, MAXLINE);
     bzero(password, MAXLINE);
     bzero(filename, MAXLINE);
+    // bzero(hints, MAXLINE);
 
     if ((n_read = read_from_socket(connfd, &recvbuf[0], MAXBUF, log)) <= 0)
         return;
@@ -166,20 +258,26 @@ void parse_request(int connfd, FILE *log){
     splitptr = strsep(&bufptr, " ");
     strcpy(&password[0], splitptr);
 
-    splitptr = strsep(&bufptr, " ");
+    splitptr = strsep(&bufptr, " "); // splitptr is verb, bufptr is filename
     if (bufptr){
         filenameptr = strsep(&bufptr, " ");
-        sprintf(&filename[0], "%s/%s", username, filenameptr);
+        sprintf(&filename[0], "%s", filenameptr);
         fprintf(log, "Found filename %s\n", &filename[0]);
     }
     if (!authenticate(connfd, &username[0], &password[0], log))
         return;
-    //printf("Authenticated!\n");
+
+    // if (bufptr)
+    //     strcpy(&hints[0], bufptr);
 
     if(strncmp(splitptr, "put", 3) == 0)
-        put(connfd, &filename[0], log);
+        put(connfd, &username[0], &filename[0], log);
     else if (strncmp(splitptr, "list", 4) == 0)
         list(connfd, &username[0], log);
+    else if (strncmp(splitptr, "get", 3) == 0)
+        get(connfd, &username[0], &filename[0], log);
+    else if (strncmp(splitptr, "query", 5) == 0)
+        query(connfd, &username[0], &filename[0], log);
 }
 
 FILE *create_logfile(connfd){

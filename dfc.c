@@ -39,9 +39,10 @@ struct dfs {
 
 struct dfs g_servers[N_SERVERS]; // Store all 4 connections
 char *g_chunkbuffers[N_SERVERS]; // Assume file chunks fit in heap
+uint32_t g_chunklens[N_SERVERS];
 char g_username[64];
 char g_password[64];
-size_t g_chunksize;
+//size_t g_chunksize;
 FILE *g_log;
 
 void encrypt(){
@@ -81,7 +82,7 @@ int connect_to_server(int serveridx){
 }
 
 
-int read_from_socket(int connfd, char *buf, size_t len, FILE *log){
+int recv_from_socket(int connfd, char *buf, size_t len){
     int n_read;
 
     n_read = recv(connfd, &buf[0], len, 0);
@@ -97,7 +98,7 @@ int read_from_socket(int connfd, char *buf, size_t len, FILE *log){
     return 0;
 }
 
-int send_to_socket(int connfd, char *buf, size_t len, FILE *log){
+int send_to_socket(int connfd, char *buf, size_t len){
     int n_sent;
 
     n_sent = send(connfd, &buf[0], len, 0);
@@ -116,6 +117,7 @@ int send_to_socket(int connfd, char *buf, size_t len, FILE *log){
 void send_by_packets(int connfd, char *buffer, int bytes){
     char sendbuf[BUFSIZE];
     int n_sent;
+    int send_size;
     int total_sent = 0;
     char *chunkptr;
 
@@ -124,13 +126,42 @@ void send_by_packets(int connfd, char *buffer, int bytes){
     chunkptr = buffer;
     while(total_sent < bytes){
         bzero(sendbuf, BUFSIZE);
-        memcpy(sendbuf, chunkptr, BUFSIZE);
-        n_sent = send_to_socket(connfd, &sendbuf[0], BUFSIZE, stdout);
+        if(total_sent + BUFSIZE < bytes)
+            send_size = BUFSIZE;
+        else
+            send_size = bytes - total_sent;
+        memcpy(sendbuf, chunkptr, send_size);
+        n_sent = send_to_socket(connfd, &sendbuf[0], send_size);
         total_sent += n_sent;
         // fprintf(g_log, "Sent %i, total %i\n", n_sent, total_sent);
         chunkptr += n_sent;
     }
-    fprintf(g_log, "Done sending packets\n");
+    fprintf(g_log, "Done sending packets; sent %i bytes\n", total_sent);
+}
+
+void recv_by_packets(int connfd, char *destination, int bytes){
+    char recvbuf[BUFSIZE];
+    int n_recv;
+    int total_recv = 0;
+    int recv_size;
+    char *chunkptr;
+
+    fprintf(g_log, "Receive by packets %i bytes from socket %i\n", bytes, connfd);
+
+    chunkptr = destination;
+    while(total_recv < bytes){
+        bzero(recvbuf, BUFSIZE);
+        if(total_recv + BUFSIZE < bytes)
+            recv_size = BUFSIZE;
+        else
+            recv_size = bytes - total_recv;
+        n_recv = recv_from_socket(connfd, &recvbuf[0], recv_size);
+        if (n_recv != recv_size)
+            fprintf(g_log, "Warning: Received different number of packets than expected\n");
+        total_recv += n_recv;
+        memcpy(chunkptr, recvbuf, n_recv);
+        chunkptr += n_recv;
+    }
 }
 
 bool send_request(int serverfd, char *verb, char *filename){
@@ -144,7 +175,7 @@ bool send_request(int serverfd, char *verb, char *filename){
     bzero(recvbuf, MAXLINE);
     n_written = sprintf(&sendbuf[0], "%s %s %s %s ", g_username, g_password, verb, filename);
 
-    n_sent = send_to_socket(serverfd, &sendbuf[0], n_written, stdout);
+    n_sent = send_to_socket(serverfd, &sendbuf[0], n_written);
     fprintf(g_log, "Sent %i bytes to socket\n", n_sent);
     if (n_sent < 0){
         fprintf(g_log, "Error sending credentials: %s\n", strerror(errno));
@@ -152,7 +183,7 @@ bool send_request(int serverfd, char *verb, char *filename){
     }
 
     // wait for approval
-    n_recv = read_from_socket(serverfd, &recvbuf[0], 3, stdout);
+    n_recv = recv_from_socket(serverfd, &recvbuf[0], 3);
     fprintf(g_log, "Server response: %s\n", &recvbuf[0]);
     if (n_recv < 3)
         return false;
@@ -164,18 +195,14 @@ bool send_request(int serverfd, char *verb, char *filename){
     return false;;
 }
 
-// void mkdir(){
-
-// }
-
 void send_chunk(char *filename, int chunkidx, int serveridx){
     int sockfd;
-    fprintf(g_log, "Sending chunk %i, chunk name %s, to server %i\n", chunkidx, filename, serveridx);
+    fprintf(g_log, "Sending chunk %i, size %i, chunk name %s, to server %i\n", chunkidx, g_chunklens[chunkidx], filename, serveridx);
 
     sockfd = connect_to_server(serveridx);
     if (!send_request(sockfd, "put", filename))
         return;
-    send_by_packets(sockfd, g_chunkbuffers[chunkidx], g_chunksize);
+    send_by_packets(sockfd, g_chunkbuffers[chunkidx], g_chunklens[chunkidx]);
     close(sockfd);
 }
 
@@ -193,14 +220,14 @@ void send_chunk_pair(int serveridx, int hashbucket, char *filename){
     bzero(fname1, MAXLINE);
     bzero(fname2, MAXLINE);
     
-    a = pairs_table[hashbucket][serveridx * 2];
-    b = pairs_table[hashbucket][serveridx * 2 + 1];
+    a = pairs_table[hashbucket][serveridx * 2]; // 1-indexed
+    b = pairs_table[hashbucket][serveridx * 2 + 1]; // 1-indexed
 
     sprintf(fname1, ".%s.%i", filename, a);
     sprintf(fname2, ".%s.%i", filename, b);
 
-    send_chunk(fname1, a-1, serveridx);
-    send_chunk(fname2, b-1, serveridx);
+    send_chunk(fname1, a-1, serveridx); // Switch to 0-indexed
+    send_chunk(fname2, b-1, serveridx); // Switch to 0-indexed
 }
 
 int read_and_hash_file(FILE *fp){
@@ -211,6 +238,7 @@ int read_and_hash_file(FILE *fp){
     char lastdigit;
     int hashbucket;
     unsigned char hash[MD5_DIGEST_LENGTH];
+    int lentotal;
 
     // check file length and choose chunk size
     fseek(fp, 0, SEEK_END);
@@ -219,13 +247,23 @@ int read_and_hash_file(FILE *fp){
     chunksize = filelen / N_SERVERS;
     if (filelen % N_SERVERS != 0)
         chunksize++;
-    g_chunksize = chunksize;
+    // g_chunksize = chunksize;
+
+    // Hacky way to set different chunk buffer sizes
+    lentotal = 0;
+    for(int i=0; i<N_SERVERS; i++){
+        g_chunklens[i] = chunksize - 1; 
+    }
+    for(int i=0; i<(filelen % N_SERVERS); i++){
+        g_chunklens[i]++;
+    }
+
     // read chunks into memory blocks and calculate hash
     MD5_Init(&md5);
     for(int i = 0; i < N_SERVERS; i++){
-        g_chunkbuffers[i] = (char *)malloc(sizeof(char) * chunksize);
+        g_chunkbuffers[i] = (char *)malloc(sizeof(char) * g_chunklens[i]);
         bzero(g_chunkbuffers[i], chunksize);
-        n_read = fread(g_chunkbuffers[i], 1, chunksize, fp);
+        n_read = fread(g_chunkbuffers[i], 1, g_chunklens[i], fp);
         MD5_Update(&md5, g_chunkbuffers[i], n_read);
     }
     MD5_Final(hash, &md5);
@@ -253,15 +291,91 @@ void put(char *filename){
     for(int i=0; i < N_SERVERS; i++){
         send_chunk_pair(i, hashbucket, filename);
     }
+    for(int i=0; i < N_SERVERS; i++){
+        free(g_chunkbuffers[i]);
+    }
     fclose(fp);
 }
 
-bool is_file_complete(){
-    return false;
+void query(int sockfd, char *filename, char *buffer){
+    int n_recv;
+
+    fprintf(g_log, "\n\n**QUERY %s**\n", filename);
+
+    bzero(buffer, N_SERVERS+1);
+    if(!send_request(sockfd, "query", filename)){
+        return;
+    }
+    n_recv = recv_from_socket(sockfd, &buffer[0], 16);
+    if(n_recv < 16)
+        fprintf(g_log, "Invalid query response\n");
 }
 
-void get(char *filename){
-    fprintf(g_log, "\n\n**GET**\n");
+bool get_piece(char *filename, int serveridx, int piece_id, uint32_t len){
+    int n_recv;
+    int sockfd;
+    char piecename[MAXLINE];
+    int n_written;
+
+    g_chunkbuffers[piece_id] = (char *)malloc(sizeof(char) * len);
+    bzero(piecename, MAXLINE);
+    n_written = sprintf(piecename, ".%s.%i", filename, piece_id+1);
+    fprintf(g_log, "Requesting piece file %s from server %i\n", piecename, serveridx);
+    sockfd = connect_to_server(serveridx);
+    if(!send_request(sockfd, "get", &piecename[0])){
+        close(sockfd);
+        return false;
+    }
+    recv_by_packets(sockfd, g_chunkbuffers[piece_id], len);
+    // n_recv = read_from_socket(sockfd, g_chunkbuffers[piece_id], len);
+    // if(n_recv != len){
+    //     fprintf(g_log, "Get piece did not get the correct number of bytes\n");
+    // }
+    close(sockfd);
+    g_chunklens[piece_id] = len;
+    return true;
+}
+
+void get_file(char *filename){
+    int pieces_found[4] = {0,0,0,0};
+    char pieces_returned[N_SERVERS * sizeof(uint32_t)]; // stores length of pieces, 0 if none
+    uint32_t *pieces_len = (uint32_t *)pieces_returned;
+    char path[MAXLINE];
+    int sockfd;
+    bool complete;
+    FILE *fp;
+
+    fprintf(g_log, "\n\n**GET %s**\n", filename);
+    for(int serveridx=0; serveridx<N_SERVERS; serveridx++){
+        sockfd = connect_to_server(serveridx);
+        query(sockfd, filename, &pieces_returned[0]);
+        close(sockfd);
+        for(int piece_id=0; piece_id<N_SERVERS; piece_id++){
+            fprintf(g_log, "Piece %i has been fetched? %i, found in server? %u\n", piece_id, pieces_found[piece_id], pieces_len[piece_id]);
+            if(!pieces_found[piece_id] && pieces_len[piece_id])
+                if(get_piece(filename, serveridx, piece_id, pieces_len[piece_id]))
+                    pieces_found[piece_id] = 1;
+        }
+    }
+    
+    complete = true;
+    for(int i=0; i< N_SERVERS; i++){
+        if(pieces_found[i] == 0)
+            complete = false;
+    }
+    if (!complete){
+        fprintf(g_log, "Could not find all pieces of %s\n", filename);
+        printf("File is incomplete\n");
+        return;
+    }
+    sprintf(path, "received/%s", filename);
+    fp = fopen(path, "w");
+    if (!fp)
+        return;
+    for(int piece_id=0; piece_id<N_SERVERS; piece_id++){
+        fwrite(g_chunkbuffers[piece_id], 1, g_chunklens[piece_id], fp);
+    }
+    fclose(fp);
     return;
 }
 
@@ -332,9 +446,7 @@ void list(){
     int n_recv;
     int socket;
     char **file_list;
-    //char file_list[MAXFILES][MAXLINE]; // can only hold 64 files
     int **pieces_list;
-    //int pieces_list[MAXFILES][N_SERVERS];
 
     fprintf(g_log, "\n\n**LIST**\n");
 
@@ -350,7 +462,7 @@ void list(){
             return;
         if (!send_request(socket, "list", ""))
             return;
-        n_recv = read_from_socket(socket, &recvbuf[0], BUFSIZE, stdout);
+        n_recv = recv_from_socket(socket, &recvbuf[0], BUFSIZE);
         parse_list(&recvbuf[0], file_list, pieces_list, n_recv);
         close(socket);
     }
@@ -363,25 +475,6 @@ void list(){
     }
     free(pieces_list);
     free(file_list);
-}
-
-void store_dfs_info(char *line, int serveridx){
-    if(serveridx > N_SERVERS){
-        perror("Invalid server ID");
-        exit(1);
-    }
-
-    char *splitptr;
-    struct dfs *server = &g_servers[serveridx];
-
-    // Parse line
-    splitptr = strsep(&line, " ");
-    strcpy(server->name, splitptr);
-    splitptr = strsep(&line, ":");
-    strcpy(server->ip, splitptr);
-    splitptr = strsep(&line, "\n");
-    strcpy(server->port, splitptr);
-    fprintf(g_log, "Filled in details for server %i: name %s, ip %s, port %s\n", serveridx, server->name, server->ip, server->port);
 }
 
 char *extract_allocate_filename_from_command(char *bufptr){
@@ -407,6 +500,7 @@ void read_commands(){
 
     while(1){
         bzero(&commandbuf, BUFSIZE);
+        fflush(stdin);
         printf("Please enter a command (get <>, put <>, delete <>, ls, exit:\n");
         fgets(commandbuf, BUFSIZE, stdin);
         commandbuf[strcspn(commandbuf, "\r\n")] = 0; // remove newlines
@@ -415,13 +509,34 @@ void read_commands(){
         else if (strncmp(&commandbuf[0], "put", 3) == 0){
             filename = extract_allocate_filename_from_command(&commandbuf[0]);
             put(filename);
+            free(filename);
         } else if (strncmp(&commandbuf[0], "ls", 2) == 0)
             list();
         else if (strncmp(&commandbuf[0], "get", 3) == 0){
             filename = extract_allocate_filename_from_command(&commandbuf[0]);
-            get(filename);
+            get_file(filename);
+            free(filename);
         }
     }
+}
+
+void store_dfs_info(char *line, int serveridx){
+    if(serveridx > N_SERVERS){
+        perror("Invalid server ID");
+        exit(1);
+    }
+
+    char *splitptr;
+    struct dfs *server = &g_servers[serveridx];
+
+    // Parse line
+    splitptr = strsep(&line, " ");
+    strcpy(server->name, splitptr);
+    splitptr = strsep(&line, ":");
+    strcpy(server->ip, splitptr);
+    splitptr = strsep(&line, "\n");
+    strcpy(server->port, splitptr);
+    fprintf(g_log, "Filled in details for server %i: name %s, ip %s, port %s\n", serveridx, server->name, server->ip, server->port);
 }
 
 bool read_conf(char *conf){
@@ -461,7 +576,6 @@ bool read_conf(char *conf){
         return false;
     }
     return true;
-    
 }
 
 FILE *create_logfile(){

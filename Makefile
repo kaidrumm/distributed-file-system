@@ -24,6 +24,7 @@ clean_files:
 	- @rm -rf DFS2/*
 	- @rm -rf DFS3/*
 	- @rm -rf DFS4/*
+	- @rm -rf client/received/*
 
 clean: clean_files
 	- @rm -f dfc dfs $(OBJECTS)
