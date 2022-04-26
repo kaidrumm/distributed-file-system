@@ -156,7 +156,10 @@ void recv_by_packets(int connfd, char *destination, int bytes){
         else
             recv_size = bytes - total_recv;
         n_recv = recv_from_socket(connfd, &recvbuf[0], recv_size);
-        if (n_recv != recv_size)
+        if (n_recv == 0){
+            fprintf(g_log, "Failure to receive by packets\n");
+            return;
+        } else if (n_recv != recv_size)
             fprintf(g_log, "Warning: Received different number of packets than expected\n");
         total_recv += n_recv;
         memcpy(chunkptr, recvbuf, n_recv);
@@ -211,7 +214,7 @@ void send_chunk(char *filename, int chunkidx, int serveridx){
     close(sockfd);
 }
 
-void send_chunk_pair(int serveridx, int hashbucket, char *filename){
+void send_chunk_pair(int serveridx, int hashbucket, char *filename, char *dir){
     int a; // Watch out! 1-indexed
     int b; // watch out! 1-indexed
     int socket_a;
@@ -228,8 +231,14 @@ void send_chunk_pair(int serveridx, int hashbucket, char *filename){
     a = pairs_table[hashbucket][serveridx * 2]; // 1-indexed
     b = pairs_table[hashbucket][serveridx * 2 + 1]; // 1-indexed
 
-    sprintf(fname1, ".%s.%i", filename, a);
-    sprintf(fname2, ".%s.%i", filename, b);
+    // so tired
+    if (dir && (dir[0] != 0)){
+        sprintf(fname1, "%s/.%s.%i", dir, filename, a);
+        sprintf(fname2, "%s/.%s.%i", dir, filename, b);
+    } else {
+        sprintf(fname1, ".%s.%i", filename, a);
+        sprintf(fname2, ".%s.%i", filename, b);
+    }
 
     send_chunk(fname1, a-1, serveridx); // Switch to 0-indexed
     send_chunk(fname2, b-1, serveridx); // Switch to 0-indexed
@@ -281,25 +290,29 @@ int read_and_hash_file(FILE *fp){
     return hashbucket;
 }
 
-void put(char *filename){
+void put(char *filename, char *dir){
     FILE *fp;
+    // char path[MAXLINE];
     int hashbucket;
 
-    fprintf(g_log, "\n\n**PUT %s**\n", filename);
+    fprintf(g_log, "\n\n**PUT %s/%s**\n", dir, filename);
+
+    // sprintf(path, "%s/%s", dir, filename);
 
     // open file
     if((fp = fopen(filename, "r")) == NULL){
         fprintf(g_log, "Failed to open file %s", filename);
         return;
     }
-    hashbucket = read_and_hash_file(fp);
+    hashbucket = read_and_hash_file(fp); // Loads file into memory buffers
+    fclose(fp);
     for(int i=0; i < N_SERVERS; i++){
-        send_chunk_pair(i, hashbucket, filename);
+        send_chunk_pair(i, hashbucket, filename, dir); // Sends from memory buffers
     }
     for(int i=0; i < N_SERVERS; i++){
         free(g_chunkbuffers[i]);
     }
-    fclose(fp);
+    
 }
 
 void query(int sockfd, char *filename, char *buffer){
@@ -316,7 +329,7 @@ void query(int sockfd, char *filename, char *buffer){
         fprintf(g_log, "Invalid query response\n");
 }
 
-bool get_piece(char *filename, int serveridx, int piece_id, uint32_t len){
+bool get_piece(char *filename, char *dir, int serveridx, int piece_id, uint32_t len){
     int n_recv;
     int sockfd;
     char piecename[MAXLINE];
@@ -324,7 +337,10 @@ bool get_piece(char *filename, int serveridx, int piece_id, uint32_t len){
 
     g_chunkbuffers[piece_id] = (char *)malloc(sizeof(char) * len);
     bzero(piecename, MAXLINE);
-    n_written = sprintf(piecename, ".%s.%i", filename, piece_id+1);
+    if(dir && dir[0])
+        n_written = sprintf(piecename, "%s/.%s.%i", dir, filename, piece_id+1);
+    else
+        n_written = sprintf(piecename, ".%s.%i", filename, piece_id+1);
     fprintf(g_log, "Requesting piece file %s from server %i\n", piecename, serveridx);
     sockfd = connect_to_server(serveridx);
     if (sockfd == 0){
@@ -341,7 +357,7 @@ bool get_piece(char *filename, int serveridx, int piece_id, uint32_t len){
     return true;
 }
 
-void get_file(char *filename){
+void get_file(char *filename, char *dir){
     int pieces_found[4] = {0,0,0,0};
     char pieces_returned[N_SERVERS * sizeof(uint32_t)]; // stores length of pieces, 0 if none
     uint32_t *pieces_len = (uint32_t *)pieces_returned;
@@ -350,19 +366,23 @@ void get_file(char *filename){
     bool complete;
     FILE *fp;
 
-    fprintf(g_log, "\n\n**GET %s**\n", filename);
+    fprintf(g_log, "\n\n**GET %s/%s**\n", dir, filename);
+    if(dir && dir[0])
+        sprintf(path, "%s/%s", dir, filename);
+    else
+        sprintf(path, "%s", filename);
     for(int serveridx=0; serveridx<N_SERVERS; serveridx++){
         sockfd = connect_to_server(serveridx);
         if (sockfd == 0){
             fprintf(g_log, "Cannot connect to server DFS%i\n", serveridx+1);
             continue;
         }
-        query(sockfd, filename, &pieces_returned[0]);
+        query(sockfd, path, &pieces_returned[0]);
         close(sockfd);
         for(int piece_id=0; piece_id<N_SERVERS; piece_id++){
             fprintf(g_log, "Piece %i has been fetched? %i, found in server? %u\n", piece_id, pieces_found[piece_id], pieces_len[piece_id]);
             if(!pieces_found[piece_id] && pieces_len[piece_id])
-                if(get_piece(filename, serveridx, piece_id, pieces_len[piece_id]))
+                if(get_piece(filename, dir, serveridx, piece_id, pieces_len[piece_id]))
                     pieces_found[piece_id] = 1;
         }
     }
@@ -449,15 +469,15 @@ void print_ls(char **file_list, int **pieces_list){
     }
 }
 
-void list(){
+void list(char *dir){
     struct dfs *server;
     char recvbuf[BUFSIZE];
     int n_recv;
-    int socket;
+    int sockfd;
     char **file_list;
     int **pieces_list;
 
-    fprintf(g_log, "\n\n**LIST**\n");
+    fprintf(g_log, "\n\n**LIST %s**\n", dir);
 
     file_list = (char **)malloc(sizeof(char *) * MAXFILES);
     pieces_list = (int **)malloc(sizeof(int *) * MAXFILES);
@@ -467,14 +487,14 @@ void list(){
     for(int i=0; i<N_SERVERS; i++){
         bzero(recvbuf, BUFSIZE);
         server = &g_servers[i];
-        if ((socket = connect_to_server(i)) == 0){
+        if ((sockfd = connect_to_server(i)) == 0){
             fprintf(g_log, "Cannot connect to server DFS%i\n", i+1);
             continue;
-        } if (!send_request(socket, "list", ""))
+        } if (!send_request(sockfd, "list", dir))
             return;
-        n_recv = recv_from_socket(socket, &recvbuf[0], BUFSIZE);
+        n_recv = recv_from_socket(sockfd, &recvbuf[0], BUFSIZE);
         parse_list(&recvbuf[0], file_list, pieces_list, n_recv);
-        close(socket);
+        close(sockfd);
     }
     print_ls(file_list, pieces_list);
     int i = 0;
@@ -487,45 +507,68 @@ void list(){
     free(file_list);
 }
 
-char *extract_allocate_filename_from_command(char *bufptr){
-    char *splitptr;
-    size_t namelen;
-    char *filename;
+void cmkdir(char *dirname){
+    struct dfs *server;
+    int sockfd;
+    fprintf(g_log, "\n\n**MKDIR %s**\n", dirname);
 
-    splitptr = bufptr;
-    strsep(&splitptr, " ");
-    if(splitptr == NULL){
-        perror("No filename for put");
-        return NULL;
+    for(int i=0; i<N_SERVERS; i++){
+        server = &g_servers[i];
+        if ((sockfd = connect_to_server(i)) == 0){
+            fprintf(g_log, "Cannot connect to server DFS%i\n", i+1);
+            return;
+        } if (!send_request(sockfd, "mkdir", dirname))
+            return;
     }
-    namelen = strlen(splitptr);
-    filename = (char *)malloc(sizeof(char) * (namelen + 1));
-    strlcpy(filename, splitptr, namelen+1);
-    return filename;
+}
+
+// Messy because I'm tired
+void extract_command_args(char *bufptr, char *first, char *second){
+    char *arg1;
+    char *arg2;
+
+    strsep(&bufptr, " "); // skip the command
+    if(bufptr == NULL){
+        fprintf(g_log, "No args found\n");
+        return;
+    }
+    arg1 = strsep(&bufptr, " ");
+    strcpy(first, arg1);
+    if (bufptr){
+        arg2 = strsep(&bufptr, " ");
+        if (arg2[strlen(arg2)-1] == '/')
+            arg2[strlen(arg2)-1] = 0; // remove trailing slash
+        strcpy(second, arg2);
+    }
 }
 
 void read_commands(){
     char commandbuf[BUFSIZE];
-    char *filename;
+    char first[MAXLINE];
+    char second[MAXLINE];
 
     while(1){
         bzero(&commandbuf, BUFSIZE);
+        bzero(&first[0], MAXLINE);
+        bzero(&second[0], MAXLINE);
         fflush(stdin);
-        printf("Please enter a command (get <>, put <>, delete <>, ls, exit:\n");
+        printf("Please enter a command (get <file> (dir), put <file> (dir), mkdir <dir>, ls (dir), exit:\n");
         fgets(commandbuf, BUFSIZE, stdin);
         commandbuf[strcspn(commandbuf, "\r\n")] = 0; // remove newlines
         if(strncmp(&commandbuf[0], "exit", 4) == 0)
             return;
         else if (strncmp(&commandbuf[0], "put", 3) == 0){
-            filename = extract_allocate_filename_from_command(&commandbuf[0]);
-            put(filename);
-            free(filename);
-        } else if (strncmp(&commandbuf[0], "ls", 2) == 0)
-            list();
-        else if (strncmp(&commandbuf[0], "get", 3) == 0){
-            filename = extract_allocate_filename_from_command(&commandbuf[0]);
-            get_file(filename);
-            free(filename);
+            extract_command_args(&commandbuf[0], &first[0], &second[0]);
+            put(&first[0], &second[0]);
+        } else if (strncmp(&commandbuf[0], "ls", 2) == 0){
+            extract_command_args(&commandbuf[0], &first[0], &second[0]);
+            list(&first[0]);
+        } else if (strncmp(&commandbuf[0], "get", 3) == 0){
+            extract_command_args(&commandbuf[0], &first[0], &second[0]);
+            get_file(&first[0], &second[0]);
+        } else if (strncmp(&commandbuf[0], "mkdir", 5) == 0){
+            extract_command_args(&commandbuf[0], &first[0], &second[0]);
+            cmkdir(&first[0]);
         }
     }
 }
