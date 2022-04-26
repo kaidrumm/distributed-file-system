@@ -61,7 +61,7 @@ int connect_to_server(int serveridx){
     hints.ai_socktype = SOCK_STREAM;
     if((status = getaddrinfo(server->ip, server->port, &hints, &servinfo)) != 0){
         fprintf(g_log, "Getaddrinfo error: %s\n", gai_strerror(errno));
-        return false;
+        return 0;
     }
 
     sockfd = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol);
@@ -71,7 +71,7 @@ int connect_to_server(int serveridx){
     }
 
     if (connect(sockfd, servinfo->ai_addr, servinfo->ai_addrlen) == -1){
-        perror("connect");
+        fprintf(g_log, "Error connecting to socket: %s\n", strerror(errno));
         close(sockfd);
         return 0;
     }
@@ -187,9 +187,10 @@ bool send_request(int serverfd, char *verb, char *filename){
     fprintf(g_log, "Server response: %s\n", &recvbuf[0]);
     if (n_recv < 3)
         return false;
-    else if (strncmp(&recvbuf[0], "no", 2) == 0)
+    else if (strncmp(&recvbuf[0], "no", 2) == 0){
+        printf("Invalid Username/Password. Please try again.\n");
         return false;
-    else if (strncmp(&recvbuf[0], "ok", 2) == 0)
+    } else if (strncmp(&recvbuf[0], "ok", 2) == 0)
         return true;
 
     return false;;
@@ -200,6 +201,10 @@ void send_chunk(char *filename, int chunkidx, int serveridx){
     fprintf(g_log, "Sending chunk %i, size %i, chunk name %s, to server %i\n", chunkidx, g_chunklens[chunkidx], filename, serveridx);
 
     sockfd = connect_to_server(serveridx);
+    if (sockfd == 0){
+        fprintf(g_log, "Cannot connect to server DFS%i\n", serveridx+1);
+        return;
+    }
     if (!send_request(sockfd, "put", filename))
         return;
     send_by_packets(sockfd, g_chunkbuffers[chunkidx], g_chunklens[chunkidx]);
@@ -322,15 +327,15 @@ bool get_piece(char *filename, int serveridx, int piece_id, uint32_t len){
     n_written = sprintf(piecename, ".%s.%i", filename, piece_id+1);
     fprintf(g_log, "Requesting piece file %s from server %i\n", piecename, serveridx);
     sockfd = connect_to_server(serveridx);
+    if (sockfd == 0){
+        fprintf(g_log, "Cannot connect to server DFS%i\n", serveridx+1);
+        return false;
+    }
     if(!send_request(sockfd, "get", &piecename[0])){
         close(sockfd);
         return false;
     }
     recv_by_packets(sockfd, g_chunkbuffers[piece_id], len);
-    // n_recv = read_from_socket(sockfd, g_chunkbuffers[piece_id], len);
-    // if(n_recv != len){
-    //     fprintf(g_log, "Get piece did not get the correct number of bytes\n");
-    // }
     close(sockfd);
     g_chunklens[piece_id] = len;
     return true;
@@ -348,6 +353,10 @@ void get_file(char *filename){
     fprintf(g_log, "\n\n**GET %s**\n", filename);
     for(int serveridx=0; serveridx<N_SERVERS; serveridx++){
         sockfd = connect_to_server(serveridx);
+        if (sockfd == 0){
+            fprintf(g_log, "Cannot connect to server DFS%i\n", serveridx+1);
+            continue;
+        }
         query(sockfd, filename, &pieces_returned[0]);
         close(sockfd);
         for(int piece_id=0; piece_id<N_SERVERS; piece_id++){
@@ -458,9 +467,10 @@ void list(){
     for(int i=0; i<N_SERVERS; i++){
         bzero(recvbuf, BUFSIZE);
         server = &g_servers[i];
-        if ((socket = connect_to_server(i)) == 0)
-            return;
-        if (!send_request(socket, "list", ""))
+        if ((socket = connect_to_server(i)) == 0){
+            fprintf(g_log, "Cannot connect to server DFS%i\n", i+1);
+            continue;
+        } if (!send_request(socket, "list", ""))
             return;
         n_recv = recv_from_socket(socket, &recvbuf[0], BUFSIZE);
         parse_list(&recvbuf[0], file_list, pieces_list, n_recv);
