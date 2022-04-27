@@ -19,12 +19,12 @@ dfs: dfs.o
 	$(CC) -c -o $@ $< $(CFLAGS) $(CPPFLAGS)
 
 clean_files:
-	- @rm -f logs/*
 	- @rm -rf DFS1/*
 	- @rm -rf DFS2/*
 	- @rm -rf DFS3/*
 	- @rm -rf DFS4/*
-	- @rm -rf client/received/*
+	- @rm -rf client*/received/*
+	- @rm -rf client*/logs/*
 
 clean: clean_files
 	- @rm -f dfc dfs $(OBJECTS)

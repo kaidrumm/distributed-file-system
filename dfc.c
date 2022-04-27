@@ -42,11 +42,18 @@ char *g_chunkbuffers[N_SERVERS]; // Assume file chunks fit in heap
 uint32_t g_chunklens[N_SERVERS];
 char g_username[64];
 char g_password[64];
-//size_t g_chunksize;
+char g_homedir[64];
 FILE *g_log;
 
-void encrypt(){
+void xorcrypt(char *data, uint32_t size, char *password){
+    char *ptr;
+    uint32_t i;
+    int keylen;
 
+    keylen = strlen(password);
+    ptr = data;
+    for(uint32_t i=0; i<size; i++)
+        *ptr++ ^= password[i % keylen];
 }
 
 int connect_to_server(int serveridx){
@@ -81,7 +88,6 @@ int connect_to_server(int serveridx){
     return sockfd;
 }
 
-
 int recv_from_socket(int connfd, char *buf, size_t len){
     int n_read;
 
@@ -92,7 +98,7 @@ int recv_from_socket(int connfd, char *buf, size_t len){
     } else if (n_read == 0){
         fprintf(g_log, "Peer hung up\n");
     } else {
-        fprintf(g_log, "Read %d bytes from socket\n", n_read);
+        //fprintf(g_log, "Read %d bytes from socket\n", n_read);
         return n_read;
     }
     return 0;
@@ -292,20 +298,20 @@ int read_and_hash_file(FILE *fp){
 
 void put(char *filename, char *dir){
     FILE *fp;
-    // char path[MAXLINE];
     int hashbucket;
 
     fprintf(g_log, "\n\n**PUT %s/%s**\n", dir, filename);
 
-    // sprintf(path, "%s/%s", dir, filename);
-
     // open file
     if((fp = fopen(filename, "r")) == NULL){
+        printf("Cannot find file %s to send to DFS\n", filename);
         fprintf(g_log, "Failed to open file %s", filename);
         return;
     }
     hashbucket = read_and_hash_file(fp); // Loads file into memory buffers
     fclose(fp);
+    for(int i=0; i<N_SERVERS; i++)
+        xorcrypt(g_chunkbuffers[i], g_chunklens[i], g_password); // Encrypt
     for(int i=0; i < N_SERVERS; i++){
         send_chunk_pair(i, hashbucket, filename, dir); // Sends from memory buffers
     }
@@ -366,15 +372,16 @@ void get_file(char *filename, char *dir){
     bool complete;
     FILE *fp;
 
-    fprintf(g_log, "\n\n**GET %s/%s**\n", dir, filename);
+    
     if(dir && dir[0])
         sprintf(path, "%s/%s", dir, filename);
     else
         sprintf(path, "%s", filename);
+    fprintf(g_log, "\n\n**GET %s**\n", path);
     for(int serveridx=0; serveridx<N_SERVERS; serveridx++){
         sockfd = connect_to_server(serveridx);
         if (sockfd == 0){
-            fprintf(g_log, "Cannot connect to server DFS%i\n", serveridx+1);
+            fprintf(g_log, "Cannot connect to server %i\n", serveridx);
             continue;
         }
         query(sockfd, path, &pieces_returned[0]);
@@ -386,7 +393,6 @@ void get_file(char *filename, char *dir){
                     pieces_found[piece_id] = 1;
         }
     }
-    
     complete = true;
     for(int i=0; i< N_SERVERS; i++){
         if(pieces_found[i] == 0)
@@ -402,7 +408,9 @@ void get_file(char *filename, char *dir){
     if (!fp)
         return;
     for(int piece_id=0; piece_id<N_SERVERS; piece_id++){
+        xorcrypt(g_chunkbuffers[piece_id], g_chunklens[piece_id], g_password); // Decrypt
         fwrite(g_chunkbuffers[piece_id], 1, g_chunklens[piece_id], fp);
+        free(g_chunkbuffers[piece_id]);
     }
     fclose(fp);
     return;
@@ -516,9 +524,9 @@ void cmkdir(char *dirname){
         server = &g_servers[i];
         if ((sockfd = connect_to_server(i)) == 0){
             fprintf(g_log, "Cannot connect to server DFS%i\n", i+1);
-            return;
+            continue;
         } if (!send_request(sockfd, "mkdir", dirname))
-            return;
+            continue;
     }
 }
 
@@ -540,6 +548,7 @@ void extract_command_args(char *bufptr, char *first, char *second){
             arg2[strlen(arg2)-1] = 0; // remove trailing slash
         strcpy(second, arg2);
     }
+    fprintf(g_log, "Found arguments %s and %s\n", first, second);
 }
 
 void read_commands(){
@@ -632,6 +641,7 @@ bool read_conf(char *conf){
 }
 
 FILE *create_logfile(){
+    mkdir("logs", 0777);
     FILE *log = fopen("logs/clientlog.txt", "a");
     if(!log){
         perror("Error opening logfile");
@@ -641,17 +651,25 @@ FILE *create_logfile(){
 }
 
 int main(int argc, char **argv){
+    int res;
 
-    if (argc != 2){
-        perror("Usage: ./dfc <config file>");
+    if (argc != 3){
+        printf("Usage: ./dfc <config file> <home directory>\n");
         return(0);
     }
+
+    res = chdir(argv[2]);
+    if(res < 0){
+        printf("Error finding home directory %s\n", argv[2]);
+        return(0);
+    }
+    strcpy(g_homedir, argv[2]);
+    mkdir("received", 0777);
     g_log = create_logfile();
     if (!read_conf(argv[1])){
         perror("Error reading conf file");
         return(1);
     }
-    chdir("client");
     read_commands();
     fclose(g_log);
     return(0);

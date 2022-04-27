@@ -38,7 +38,7 @@ int read_from_socket(int connfd, char *buf, size_t len, FILE *log){
     } else if (n_read == 0){
         fprintf(log, "Peer hung up\n");
     } else {
-        fprintf(log, "Read %d bytes from socket\n", n_read);
+        //fprintf(log, "Read %d bytes from socket\n", n_read);
         return n_read;
     }
     return -1;
@@ -54,7 +54,7 @@ int send_to_socket(int connfd, char *buf, size_t len, FILE *log){
     } else if (n_sent < len){
         fprintf(log, "Sent partial message, please fix\n");
     } else {
-        fprintf(log, "Sent %d bytes to socket\n", n_sent);
+        //fprintf(log, "Sent %d bytes to socket\n", n_sent);
         return n_sent;
     }
     return -1;
@@ -71,6 +71,7 @@ void send_from_file_to_socket(FILE *fp, int connfd, FILE *log){
         n_sent = send_to_socket(connfd, &buf[0], n_read, log);
         n_read = fread(buf, 1, MAXBUF, fp);
     }
+    fprintf(log, "Done sending file\n");
 }
 
 void put(int connfd, char *username, char *filename, FILE *log){
@@ -85,6 +86,8 @@ void put(int connfd, char *username, char *filename, FILE *log){
     bzero(path, MAXLINE);
     sprintf(path, "%s/%s", username, filename);
 
+    fprintf(log, "\nPUT %s\n", path);
+
     if((fp = fopen(path, "w")) == NULL){
         fprintf(log, "Error creating file %s\n", filename);
         return;
@@ -97,18 +100,20 @@ void put(int connfd, char *username, char *filename, FILE *log){
         bzero(recvbuf, MAXBUF);
     }
     fclose(fp);
+    fprintf(log, "Finished saving file\n");
 }
 
-void get(int connfd, char *username, char *filename, char *subdir, FILE *log){
-    FILE *fp;
+//void get(int connfd, char *username, char *filename, char *subdir, FILE *log){
+void get(int connfd, char *username, char *filename, FILE *log){    FILE *fp;
     char path[MAXLINE];
 
-    fprintf(log, "Sending file piece %s %s %s\n", username, subdir, filename);
+    // fprintf(log, "\nGET file piece %s %s %s\n", username, subdir, filename);
+    fprintf(log, "\nGET file piece %s %s\n", username, filename);
 
-    if(subdir && subdir[0])
-        sprintf(path, "%s/%s/%s", username, subdir, filename);
-    else
-        sprintf(path, "%s/%s", username, filename);
+    // if(subdir && subdir[0])
+    //     sprintf(path, "%s/%s/%s", username, subdir, filename);
+    // else
+    sprintf(path, "%s/%s", username, filename);
 
     if ((fp = fopen(path, "r")) == 0){
         fprintf(log, "Did not find file %s\n", path);
@@ -117,6 +122,7 @@ void get(int connfd, char *username, char *filename, char *subdir, FILE *log){
     fprintf(log, "Found file %s\n", path);
     send_from_file_to_socket(fp, connfd, log);
     fclose(fp);
+    fprintf(log, "Finished sending file\n");
 }
 
 uint32_t get_file_len(char *username, char *filename, FILE *log){
@@ -138,7 +144,6 @@ uint32_t get_file_len(char *username, char *filename, FILE *log){
     return len;
 }
 
-// Semi redundant with list, but I don't want to use RegEx matching for the names
 void query(int connfd, char *username, char *path, FILE *log){
     char sendbuf[16]; // room for four uint32_t numbers
     uint32_t *bufptr;
@@ -152,6 +157,8 @@ void query(int connfd, char *username, char *path, FILE *log){
     char local_filename[MAXLINE];
     char folders[MAXLINE];
     char *filename;
+
+    fprintf(log, "\nQUERY %s %s\n", username, path);
 
     filename = strrchr(path, '/'); // find last instance of slash
     if (!filename){
@@ -206,7 +213,7 @@ void list(int connfd, char *username, char *subfolder, FILE *log){
     int n_sent;
     int n_written;
 
-    fprintf(log, "Sending file list for %s, %s\n", username, subfolder);
+    fprintf(log, "\nLIST for %s, %s\n", username, subfolder);
 
     sprintf(path, "%s/%s", username, subfolder);
     
@@ -234,6 +241,8 @@ void list(int connfd, char *username, char *subfolder, FILE *log){
 
 void cmkdir(int connfd, char *username, char *dirname, FILE *log){
     char pathbuf[MAXLINE];
+
+    fprintf(log, "\nMKDIR %s\n", dirname);
 
     sprintf(pathbuf, "%s/%s", username, dirname);
     mkdir(pathbuf, 0777);
@@ -265,7 +274,7 @@ void parse_request(int connfd, FILE *log){
     char username[MAXLINE];
     char password[MAXLINE];
     char filename[MAXLINE];
-    char subdir[MAXLINE];
+    // char subdir[MAXLINE];
     char *bufptr;
     char *splitptr;
     char *filenameptr;
@@ -275,7 +284,7 @@ void parse_request(int connfd, FILE *log){
     bzero(username, MAXLINE);
     bzero(password, MAXLINE);
     bzero(filename, MAXLINE);
-    bzero(subdir, MAXLINE);
+    // bzero(subdir, MAXLINE);
 
     if ((n_read = read_from_socket(connfd, &recvbuf[0], MAXBUF, log)) <= 0)
         return;
@@ -293,11 +302,11 @@ void parse_request(int connfd, FILE *log){
         sprintf(&filename[0], "%s", filenameptr);
         fprintf(log, "Found filename %s\n", &filename[0]);
     }
-    if (bufptr){
-        dirptr = strsep(&bufptr, " ");
-        sprintf(&subdir[0], "%s", dirptr);
-        fprintf(log, "Found directory %s\n", &subdir[0]);
-    }
+    // if (bufptr){
+    //     dirptr = strsep(&bufptr, " ");
+    //     sprintf(&subdir[0], "%s", dirptr);
+    //     fprintf(log, "Found directory %s\n", &subdir[0]);
+    // }
     if (!authenticate(connfd, &username[0], &password[0], log))
         return;
 
@@ -306,7 +315,8 @@ void parse_request(int connfd, FILE *log){
     else if (strncmp(splitptr, "list", 4) == 0)
         list(connfd, &username[0], &filename[0], log);
     else if (strncmp(splitptr, "get", 3) == 0)
-        get(connfd, &username[0], &filename[0], &subdir[0], log);
+        get(connfd, &username[0], &filename[0], log);
+        //get(connfd, &username[0], &filename[0], &subdir[0], log);
     else if (strncmp(splitptr, "query", 5) == 0)
         query(connfd, &username[0], &filename[0], log);
     else if (strncmp(splitptr, "mkdir", 5) == 0)
